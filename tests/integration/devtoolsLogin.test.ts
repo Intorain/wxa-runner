@@ -1,5 +1,5 @@
 /**
- * 真实登录接口：开发服务器带着开发者 ticket 向微信换取 code 和手机号
+ * 开发者工具登录态的接口：开发服务器带着开发者 ticket 向微信换取 code 和手机号
  *
  * 微信服务器用 fetch 桩代替，响应格式取自对微信服务器的实测；
  * 访问本地接口用 http.request，才能自定义 Host 头。
@@ -10,7 +10,7 @@ import { AddressInfo } from 'net';
 import express from 'express';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { DeveloperTicket, TICKET_ENV } from '../../packages/extractor/src/devtools';
-import { realLoginRouter } from '../../packages/core/src/server/realLogin';
+import { devtoolsLoginRouter } from '../../packages/core/src/server/devtoolsLogin';
 import { collectSetupEnv } from '../../packages/core/src/server/setup';
 
 const LATER = Date.now() + 3600_000;
@@ -34,7 +34,7 @@ let ticket: DeveloperTicket | null = null;
 
 beforeAll(async () => {
   const app = express();
-  app.use('/__wxa__/api', realLoginRouter('wx-app', () => ticket));
+  app.use('/__wxa__/api', devtoolsLoginRouter('wx-app', () => ticket));
   server = app.listen(0, '127.0.0.1');
   await new Promise(resolve => server.once('listening', resolve));
   port = (server.address() as AddressInfo).port;
@@ -69,7 +69,7 @@ function stubWechat(body: object) {
   return fetchMock;
 }
 
-describe('真实登录接口', () => {
+describe('开发者工具登录态的接口', () => {
   it('wx.login：用开发者 ticket 请求 jslogin，返回微信签发的 code', async () => {
     ticket = { newticket: 'a+b&c=d', expiredAt: LATER };
     const fetchMock = stubWechat({ baseresponse: { errcode: 0, errmsg: 'ok' }, code: '0e3LEm' });
@@ -140,7 +140,7 @@ describe('真实登录接口', () => {
     ticket = { newticket: 't', expiredAt: LATER };
     const fetchMock = stubWechat({ baseresponse: { errcode: 0 }, code: 'c' });
 
-    expect(await post('/login', { host: `evil.example:${port}` })).toEqual({ status: 403, body: { error: '真实登录接口只允许本机访问' } });
+    expect(await post('/login', { host: `evil.example:${port}` })).toEqual({ status: 403, body: { error: '开发者登录态接口只允许本机访问' } });
     expect(fetchMock).not.toHaveBeenCalled();
     expect((await post('/login', { host: `[::1]:${port}` })).status).toBe(200);
     expect((await post('/login', { host: `localhost:${port}` })).status).toBe(200);
@@ -180,6 +180,45 @@ describe('真实登录接口', () => {
     expect(body.error).toContain('webapi_getuserinfo');
     expect((await post('/operate-wx-data', {}, {})).status).toBe(403);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('插件校验：用开发者 ticket 请求 verifyplugin，返回插件能访问的域名', async () => {
+    ticket = { newticket: 't', expiredAt: LATER };
+    const list = [{ plugin_id: 'wxplugin', request_domain: ['https://api.example.com'], host_sign: 'sign' }];
+    const fetchMock = stubWechat({ baseresponse: { errcode: 0 }, list });
+
+    const request = { plugins: [{ provider: 'wxplugin', inner_version: 0 }] };
+    expect(await post('/verify-plugin', {}, { data: request })).toEqual({ status: 200, body: { data: { list } } });
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(new URL(url).pathname).toBe('/wxa-dev-logic/verifyplugin');
+    // 与开发者工具一致：基础库给的 data 序列化后放在 ext_info 里
+    expect(JSON.parse(JSON.parse(init.body as string).ext_info)).toEqual(request);
+  });
+
+  it('插件信息：请求 batchgetcontact，按基础库要的格式交回每个插件的信息', async () => {
+    ticket = { newticket: 't', expiredAt: LATER };
+    const pluginList = [{ nickname: '快递跟踪', PluginNetWork: { RequestDomain: ['https://api.example.com'] } }];
+    const fetchMock = stubWechat({
+      baseresponse: { errcode: 0 },
+      contact_list: [{ appid: 'wxplugin', plugin_info: { plugin_list: pluginList } }, { appid: 'wxother' }]
+    });
+
+    expect(await post('/batch-get-contact', {}, { appIds: ['wxplugin', 'wxother'] })).toEqual({
+      status: 200,
+      body: { contactList: [{ appId: 'wxplugin', plugin_list: pluginList }] }
+    });
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(new URL(url).pathname).toBe('/wxa-dev-logic/batchgetcontact');
+    expect(JSON.parse(init.body as string)).toEqual({ appid_list: ['wxplugin', 'wxother'] });
+  });
+
+  it('插件校验：微信拒绝时说明原因和处理办法', async () => {
+    ticket = { newticket: 't', expiredAt: LATER };
+    stubWechat({ baseresponse: { errcode: 40001, errmsg: 'invalid credential' } });
+
+    const { status, body } = await post('/verify-plugin', {}, { data: {} });
+    expect(status).toBe(500);
+    expect(body.error).toBe('插件校验失败 40001: invalid credential（登录态已失效，请在微信开发者工具里重新登录）');
   });
 
   it('开发者 ticket 的环境变量不会随 setup 下发给浏览器', () => {

@@ -183,6 +183,24 @@ describe('网络 API', () => {
     expect(recorded).toEqual([]);
   });
 
+  it('插件里的 wx.request 经代理发出、记入请求记录：基础库同样标了 __skipDomainCheck__，但带着插件签名', async () => {
+    const recorded: Array<{ url: string }> = [];
+    const events: Array<[string, any]> = [];
+    const fetchMock = vi.fn(async (..._args: unknown[]) => proxied('{"ok":true}', 200, { 'content-type': 'application/json' })());
+    vi.stubGlobal('fetch', fetchMock);
+    const apis = createNetworkApis({
+      emit: (event, data) => events.push([event, data]), defaultTimeout: () => 60000, onRequest: request => recorded.push(request)
+    });
+
+    // 基础库按 verifyPlugin 给的域名校验过插件的请求，加上签名头后标 __skipDomainCheck__ 交给原生
+    const header = { 'X-WECHAT-HOSTSIGN': '{"noncestr":"n","timestamp":1,"signature":"s"}' };
+    call(apis, 'createRequestTask', { url: 'https://plugin.example.com/data', method: 'GET', header, __skipDomainCheck__: true });
+
+    await vi.waitFor(() => expect(events.some(([, data]) => data.state === 'success')).toBe(true));
+    expect(fetchMock.mock.calls[0][0]).toBe('/__wxa__/proxy?url=' + encodeURIComponent('https://plugin.example.com/data'));
+    expect(recorded.map(request => request.url)).toEqual(['https://plugin.example.com/data']);
+  });
+
   it('基础库为 InnerAudioContext 下载音频的内部请求经代理发出，success 的 data 是 ArrayBuffer，不记入请求记录', async () => {
     const recorded: unknown[] = [];
     const events: Array<[string, any]> = [];
@@ -298,9 +316,9 @@ describe('其它 API', () => {
     });
   });
 
-  it('没开真实登录时，服务市场调用明确失败并提示加 --real-login', () => {
+  it('没开 --devtools-login 时，服务市场调用明确失败并提示加 --devtools-login', () => {
     const res = call(apis, 'operateWXData', { data: { api_name: 'webapi_servicemarket_jsapi_comm', data: {} } });
-    expect(res.errMsg).toMatch(/^operateWXData:fail .*--real-login/);
+    expect(res.errMsg).toMatch(/^operateWXData:fail .*--devtools-login/);
   });
 
   it('开放接口返回可预测的模拟数据，支付明确失败', () => {
@@ -382,7 +400,7 @@ function phoneCodeSeenByBaseLib(result: { data?: string }): string | undefined {
   return result.data ? JSON.parse(result.data).code : undefined;
 }
 
-describe('真实登录（--real-login）', () => {
+describe('开发者工具登录态（--devtools-login）', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
   });
@@ -390,10 +408,10 @@ describe('真实登录（--real-login）', () => {
   function invoke(api: string, response: Response, args: Record<string, any> = {}) {
     const fetchMock = vi.fn(async (..._args: unknown[]) => response);
     vi.stubGlobal('fetch', fetchMock);
-    const onRealLoginFail = vi.fn();
+    const onDevtoolsLoginFail = vi.fn();
     const registry = new ApiRegistry();
-    registry.register(createMiscApis('wx1', { realLogin: true, onRealLoginFail }));
-    return { result: registry.invoke(api, args, { api, from: 'service', webviewId: 1 }) as Promise<ApiResult>, fetchMock, onRealLoginFail };
+    registry.register(createMiscApis('wx1', { devtoolsLogin: true, onDevtoolsLoginFail }));
+    return { result: registry.invoke(api, args, { api, from: 'service', webviewId: 1 }) as Promise<ApiResult>, fetchMock, onDevtoolsLoginFail };
   }
 
   const json = (body: object, status = 200) => new Response(JSON.stringify(body), { status });
@@ -420,11 +438,11 @@ describe('真实登录（--real-login）', () => {
   it('失败时把 API 名称和原因交给宿主页面提示开发者，成功时不提示', async () => {
     const failed = invoke('getPhoneNumber', json({ error: '微信开发者工具的登录态已过期' }, 500));
     await failed.result;
-    expect(failed.onRealLoginFail).toHaveBeenCalledWith('getPhoneNumber', '微信开发者工具的登录态已过期');
+    expect(failed.onDevtoolsLoginFail).toHaveBeenCalledWith('getPhoneNumber', '微信开发者工具的登录态已过期');
 
     const succeeded = invoke('login', json({ code: 'real-code' }));
     await succeeded.result;
-    expect(succeeded.onRealLoginFail).not.toHaveBeenCalled();
+    expect(succeeded.onDevtoolsLoginFail).not.toHaveBeenCalled();
   });
 
   it('wx.serviceMarket 的请求经开发服务器发给微信，结果原样交给基础库', async () => {
@@ -440,17 +458,30 @@ describe('真实登录（--real-login）', () => {
 
   it('服务市场调用失败时，业务代码收到 fail，宿主页面提示是哪个接口', async () => {
     const request = { api_name: 'webapi_servicemarket_jsapi_comm', data: {} };
-    const { result, onRealLoginFail } = invoke('operateWXData', json({ error: '服务市场调用失败 40001: invalid credential' }, 500), { data: request });
+    const { result, onDevtoolsLoginFail } = invoke('operateWXData', json({ error: '服务市场调用失败 40001: invalid credential' }, 500), { data: request });
 
     // 带上 err_code，基础库才会把原因拼进 invokeService 的错误
     expect(await result).toEqual({ errMsg: 'operateWXData:fail 服务市场调用失败 40001: invalid credential', err_code: -1 });
-    expect(onRealLoginFail).toHaveBeenCalledWith('serviceMarket.invokeService', '服务市场调用失败 40001: invalid credential');
+    expect(onDevtoolsLoginFail).toHaveBeenCalledWith('serviceMarket.invokeService', '服务市场调用失败 40001: invalid credential');
   });
 
-  it('开启真实登录后，基础库拉取配置的 operateWXData 不发给开发服务器', () => {
+  it('开启 --devtools-login后，基础库拉取配置的 operateWXData 不发给开发服务器', () => {
     const { result, fetchMock } = invoke('operateWXData', json({}), { data: { api_name: 'webapi_getwxabusinessconfig' } });
     expect(result).toEqual({ errMsg: 'operateWXData:ok' });
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('基础库校验插件、拉插件信息时经开发服务器向微信取，结果原样交给基础库', async () => {
+    const list = [{ plugin_id: 'wxplugin', request_domain: ['https://api.example.com'] }];
+    const verify = invoke('verifyPlugin', json({ data: { list } }), { data: { plugins: [{ provider: 'wxplugin' }] } });
+    expect(await verify.result).toEqual({ data: { list }, errMsg: 'verifyPlugin:ok' });
+    expect(verify.fetchMock.mock.calls[0][0]).toBe('/__wxa__/api/verify-plugin');
+    expect(JSON.parse((verify.fetchMock.mock.calls[0][1] as RequestInit).body as string)).toEqual({ data: { plugins: [{ provider: 'wxplugin' }] } });
+
+    const contactList = [{ appId: 'wxplugin', plugin_list: [{ nickname: '快递跟踪' }] }];
+    const contact = invoke('batchGetContact', json({ contactList }), { appIds: ['wxplugin'] });
+    expect(await contact.result).toEqual({ contactList, errMsg: 'batchGetContact:ok' });
+    expect(contact.fetchMock.mock.calls[0][0]).toBe('/__wxa__/api/batch-get-contact');
   });
 
   it('响应不是 JSON 时（如代理返回的错误页）fail 消息带上状态码', async () => {
