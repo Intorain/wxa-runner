@@ -1,5 +1,5 @@
 /**
- * 宿主、逻辑层、渲染层的 HTML
+ * 宿主、逻辑层、渲染层的 HTML，以及 Worker 的入口脚本
  */
 
 import { BuildResult, toJs } from '../project/AppBuilder';
@@ -144,6 +144,30 @@ ${window.disableScroll ? '<style>body{overflow-y:hidden}</style>' : ''}
 </script>
 </body>
 </html>`;
+}
+
+/**
+ * Worker 的入口（/__wxa__/worker.js?id=），由逻辑层的原生 WeixinWorker 创建（runtime/workers.ts）。
+ * 和开发者工具一样先放 __wxConfig 和原生接口（runtime/worker.ts），再加载 Worker 基础库和 workers 目录下的模块；
+ * 模块逐个加载，DevTools 里保留原文件名和行号。
+ * Worker 基础库把 console 换成转发给逻辑层的版本，转发时对象被转成文本；开发者工具加载完基础库后换回原来的，日志留在 Worker 里。
+ * 基础库目录里没有 WAWorker.js 时（如只放了逻辑层和渲染层文件的旧版内置基础库），直接抛出异常说明缺少的文件，由逻辑层的 Worker 对象记入 errors()（runtime/workers.ts）
+ */
+export function workerScript(build: BuildResult, baseLib: { version: string; hasWorker: boolean }): string {
+  const modules = build.workerModules.map(id => `/__wxa__/module/${encodeURI(id)}?v=${build.version}`);
+  const prelude = `var __wxConfig = ${toJs(build.wxConfig)};
+importScripts('/__wxa__/runtime/worker.js');
+`;
+  if (!baseLib.hasWorker) {
+    const message = `[wxa-runner] 基础库 ${baseLib.version} 里没有 WAWorker.js，Worker 不能运行。换用开发者工具下载的基础库，或升级 wxa-runner 带上新的内置基础库`;
+    return `${prelude}throw new Error(${toJs(message)});
+`;
+  }
+  return `${prelude}var __wxaConsole = self.console;
+importScripts('/__baselib__/WAWorker.js');
+self.console = __wxaConsole;
+importScripts(${modules.map(url => toJs(url)).join(', ')});
+`;
 }
 
 function escapeHtml(text: string): string {
