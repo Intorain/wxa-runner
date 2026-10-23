@@ -142,7 +142,7 @@ ${pageWindow(build, pagePath).disableScroll ? '<style>body{overflow-y:hidden}</s
  */
 export function workerScript(build: BuildResult, baseLib: { version: string; hasWorker: boolean }): string {
   const modules = build.workerModules.map(id => `/__wxa__/module/${encodeURI(id)}?v=${build.version}`);
-  const prelude = `var __wxConfig = ${toJs(build.wxConfig)};
+  const prelude = `var __wxConfig = ${toJs(build.wxConfig)}; __wxConfig.env.USER_DATA_PATH = location.origin + "/__wxa__/usr/" + new URL(location.href).searchParams.get("session");
 importScripts('/__wxa__/runtime/worker.js');
 `;
   if (!baseLib.hasWorker) {

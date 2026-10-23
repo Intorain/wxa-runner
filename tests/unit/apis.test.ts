@@ -3,6 +3,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { FileStore } from '../../packages/core/src/server/FileStore';
 import { createFileSystemApis } from '../../packages/core/src/runtime/host/api/fs';
 import { createMiscApis } from '../../packages/core/src/runtime/host/api/misc';
 import { createNetworkApis } from '../../packages/core/src/runtime/host/api/network';
@@ -267,6 +268,7 @@ describe('网络 API', () => {
   });
 
   it('downloadFile 把下载的文件存成开发服务器上的临时文件，返回它的地址', async () => {
+    vi.stubGlobal('localStorage', { getItem: () => 'test-session' });
     const saved: Array<{ url: string; content: string }> = [];
     const { apis, events } = setup(proxied('file-content'));
     vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
@@ -278,7 +280,7 @@ describe('网络 API', () => {
     const { downloadTaskId } = call(apis, 'createDownloadTask', { url: 'https://cdn.example.com/a.png?v=2' });
 
     await vi.waitFor(() => expect(events.some(([, d]) => d.state === 'success')).toBe(true));
-    expect(saved).toEqual([{ url: '/__wxa__/tmp?type=png', content: 'file-content' }]);
+    expect(saved).toEqual([{ url: '/__wxa__/tmp/test-session?type=png', content: 'file-content' }]);
     expect(events.at(-1)).toEqual(['onDownloadTaskStateChange', expect.objectContaining({
       downloadTaskId, state: 'success', tempFilePath: 'http://localhost:3000/__wxa__/tmp/saved.png', statusCode: 200
     })]);
@@ -286,15 +288,39 @@ describe('网络 API', () => {
 });
 
 describe('文件系统', () => {
-  const apis = createFileSystemApis();
+  const files = new FileStore();
+  const apis = createFileSystemApis(files.execute.bind(files));
 
   it('文件系统 API 与基础库的调用格式一致', () => {
     expect(call(apis, 'access', { path: 'http://usr/x' }).errMsg).toMatch(/^access:fail no such file/);
     expect(call(apis, 'mkdir', { dirPath: 'http://usr/logs', recursive: true }).errMsg).toBe('mkdir:ok');
     call(apis, 'writeFile', { filePath: 'http://usr/logs/1.log', data: 'hello' });
-    expect(call(apis, 'readFileSync', { filePath: 'http://usr/logs/1.log' })).toMatchObject({ data: 'hello' });
+    expect(call(apis, 'readFileSync', { filePath: 'http://usr/logs/1.log', encoding: 'utf8' })).toMatchObject({ data: 'hello' });
     expect(call(apis, 'stat', { path: 'http://usr/logs/1.log' }).stats).toMatchObject({ size: 5 });
     expect(call(apis, 'readdir', { dirPath: 'http://usr/logs' }).files).toEqual(['1.log']);
+  });
+
+  describe('经开发服务器读写', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+    const respond = (body: string, status = 200) => {
+      vi.stubGlobal('localStorage', { getItem: () => 'session-1', setItem: () => undefined });
+      const fetchMock = vi.fn(async () => new Response(body, { status }));
+      vi.stubGlobal('fetch', fetchMock);
+      return fetchMock;
+    };
+
+    it('异步接口按会话请求，文件不存在等失败从响应体的 error 取原因', async () => {
+      const fetchMock = respond(JSON.stringify({ error: 'no such file or directory http://usr/x' }));
+      expect((await call(createFileSystemApis(), 'access', { path: 'http://usr/x' })).errMsg).toBe('access:fail no such file or directory http://usr/x');
+      expect(fetchMock).toHaveBeenCalledWith('/__wxa__/fs/session-1', expect.objectContaining({ method: 'POST' }));
+    });
+
+    it('请求被拒绝（如请求体超过上限）时响应不是 JSON，报状态码', async () => {
+      respond('<!DOCTYPE html><title>PayloadTooLargeError</title>', 413);
+      expect((await call(createFileSystemApis(), 'writeFile', { filePath: 'http://usr/a', data: 'x' })).errMsg).toBe('writeFile:fail filesystem HTTP 413');
+    });
   });
 });
 
@@ -344,7 +370,8 @@ describe('读取代码包里的文件', () => {
     };
     const fetchMock = vi.fn(async (url: string) => (files[url] ? new Response(files[url]) : new Response('', { status: 404 })));
     vi.stubGlobal('fetch', fetchMock);
-    return { apis: createFileSystemApis(), fetchMock };
+    const store = new FileStore();
+    return { apis: createFileSystemApis(store.execute.bind(store)), fetchMock };
   }
 
   it('readFile 不指定编码时得到 ArrayBuffer，指定 utf8 时得到文本，路径可以不以 / 开头', async () => {
@@ -364,15 +391,15 @@ describe('读取代码包里的文件', () => {
     expect((await call(apis, 'readFile', { filePath: '/assets/hello.txt', encoding: 'hex' })).errMsg).toMatch(/^readFile:fail /);
   });
 
-  it('用户目录（http://usr/）下的文件只在内存文件系统里找，不向开发服务器取', async () => {
+  it('用户文件只访问文件存储，不向代码包静态资源接口取', async () => {
     const { apis, fetchMock } = setup();
     call(apis, 'writeFile', { filePath: 'http://usr/a.txt', data: 'local' });
-    expect(await call(apis, 'readFile', { filePath: 'http://usr/a.txt' })).toMatchObject({ data: 'local' });
+    expect(await call(apis, 'readFile', { filePath: 'http://usr/a.txt', encoding: 'utf8' })).toMatchObject({ data: 'local' });
     expect((await call(apis, 'readFile', { filePath: 'http://usr/assets/data.bin' })).errMsg).toMatch(/^readFile:fail no such file/);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('readFileSync 同步返回，只读内存文件系统：代码包里的文件读不到，也不向开发服务器取', () => {
+  it('readFileSync 同步读取可写文件存储，不读取代码包静态资源', () => {
     const { apis, fetchMock } = setup();
     expect(call(apis, 'readFileSync', { filePath: 'assets/data.bin' }).errMsg).toMatch(/^readFileSync:fail no such file/);
     expect(fetchMock).not.toHaveBeenCalled();

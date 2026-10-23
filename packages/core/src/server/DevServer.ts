@@ -13,7 +13,9 @@
  *   /__baselib__/*             官方基础库
  *   /__wxa__/proxy/<协议>/<域名><路径>  网络代理，如 /__wxa__/proxy/https/api.example.com/a?b=1
  *   /__wxa__/mock/<协议>/<域名><路径>   被拦截的请求在 Network 面板里的地址，由 Service Worker（runtime/sw.js）返回响应
- *   /__wxa__/tmp               临时文件：POST ?type=png 保存，返回可直接访问的地址（GET 支持分段请求）；对该地址 HEAD 查大小、DELETE 删除
+ *   /__wxa__/fs/<会话>          文件系统接口（FileSystemManager），每个浏览器会话一份文件，会话标识见 runtime/fileSession.ts
+ *   /__wxa__/tmp/<会话>         临时文件：POST ?type=png 保存，返回可直接访问的地址（GET 支持分段请求）；对该地址 HEAD 查大小、DELETE 删除
+ *   /__wxa__/usr/<会话>/<路径>   用户目录（USER_DATA_PATH）下的文件，image 等组件和 uploadFile 按地址读取
  *   /__wxa__/region/<kind>     地区选择器用的行政区划数据（districts / streets），取自本机开发者工具
  *   /__wxa__/api/*             --devtools-login：wx.login 的 code、手机号，服务市场、插件的请求转发，只允许本机访问
  *   /__wxa__/ws                文件变化通知：热更新（hot）或整页刷新（reload）；开启 forwardConsole 时浏览器从这里发来报错
@@ -21,6 +23,7 @@
  */
 
 import { randomUUID } from 'crypto';
+import { FileStore } from './FileStore';
 import fs from 'fs';
 import http from 'http';
 import net from 'net';
@@ -105,7 +108,7 @@ export class DevServer {
   private address = '';
   private lanAccess = false;
   /** 运行时生成的临时文件（canvas 导出、拍照等），随服务器进程存在 */
-  private readonly tempFiles = new Map<string, Buffer>();
+  private readonly fileSessions = new Map<string, FileStore>();
   private readonly devtoolsLogin: boolean;
   /** 开启 --devtools-login 时才有 */
   private readonly ticketSource: TicketSource | null;
@@ -196,6 +199,7 @@ export class DevServer {
       server.closeAllConnections();
       await new Promise<void>(resolve => server.close(() => resolve()));
     }
+    this.fileSessions.clear();
   }
 
   private createApp(): Express {
@@ -353,16 +357,46 @@ export class DevServer {
         + 'Service Worker 没有生效（如 DevTools 勾选了 Bypass for network），看不到拦截规则给出的响应');
     });
 
-    // 返回完整的 http 地址：image、video 组件只原样使用 http(s) 地址，其余的会被当成页面相对路径
-    app.post('/__wxa__/tmp', express.raw({ type: () => true, limit: '100mb' }), (req, res) => {
+    // 每个浏览器会话一份 FileStore：刷新复用，不同的浏览器上下文（Playwright 的每个用例）互不可见。
+    // 会话标识要拼进文件地址，只接受 fileSession() 生成的格式；不合法时返回 null
+    const sessionFiles = (session: string): FileStore | null => {
+      if (!/^[a-z0-9-]{1,80}$/i.test(session)) return null;
+      let files = this.fileSessions.get(session);
+      if (!files) {
+        files = new FileStore([`/__wxa__/usr/${session}`, `/__wxa__/tmp/${session}`]);
+        this.fileSessions.set(session, files);
+      }
+      return files;
+    };
+    app.post('/__wxa__/fs/:session', express.json({ limit: '150mb' }), (req, res) => {
+      const files = sessionFiles(req.params.session);
+      if (!files) {
+        res.status(400).json({ error: `invalid filesystem session ${req.params.session}` });
+        return;
+      }
+      // 文件不存在等是接口的正常失败，照样返回 200，免得每次失败都在浏览器控制台留下一条请求错误（基础库启动时就会探测不存在的文件）
+      try {
+        res.json({ result: files.execute(req.body.operation, req.body.args || {}) });
+      } catch (error) {
+        res.json({ error: (error as Error).message });
+      }
+    });
+
+    // 返回完整的 http 地址：image、video 组件只原样使用 http(s) 地址。
+    app.post('/__wxa__/tmp/:session', express.raw({ type: () => true, limit: '100mb' }), (req, res) => {
       const type = String(req.query.type || 'png');
       if (!/^[a-z0-9]+$/i.test(type)) {
         res.status(400).type('text').send(`非法的文件类型 ${type}`);
         return;
       }
-      const name = `${randomUUID()}.${type}`;
-      this.tempFiles.set(name, Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0));
-      res.json({ url: `${req.protocol}://${req.get('host')}/__wxa__/tmp/${name}` });
+      const files = sessionFiles(req.params.session);
+      if (!files) {
+        res.status(400).type('text').send(`非法的会话标识 ${req.params.session}`);
+        return;
+      }
+      const filePath = `/__wxa__/tmp/${req.params.session}/${randomUUID()}.${type}`;
+      files.write(filePath, Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0));
+      res.json({ url: `${req.protocol}://${req.get('host')}${filePath}` });
     });
     app.get('/__wxa__/region/:kind', (req, res) => {
       const kind = req.params.kind;
@@ -374,15 +408,17 @@ export class DevServer {
       res.type('text/plain; charset=utf-8').set('Cache-Control', 'public, max-age=86400').send(data);
     });
 
-    app.get('/__wxa__/tmp/:name', (req, res) => {
-      const data = this.tempFiles.get(req.params.name);
-      if (!data) {
+    app.get<{ kind: string; session: string; 0: string }>('/__wxa__/:kind(usr|tmp)/:session/*', (req, res) => {
+      const files = this.fileSessions.get(req.params.session);
+      const node = files?.stat(`/__wxa__/${req.params.kind}/${req.params.session}/` + req.params[0]);
+      if (!node || node.dir) {
         res.status(404).end();
         return;
       }
-      res.type(path.extname(req.params.name));
-      // 临时文件保存后不会改写，文件名就能作 ETag，分段和完整响应一致，也不用每次对整个文件算摘要
-      res.setHeader('ETag', `"${req.params.name}"`);
+      const data = node.data;
+      res.type(path.extname(req.params[0]));
+      // 每次写入更新版本号，追加和 Range 请求不再对整份文件计算哈希。
+      res.setHeader('ETag', `"${node.etag}"`);
       // 支持分段请求，video 组件播放临时文件时才能跳转（不支持时浏览器认为视频不能跳转，seek 不起作用）
       res.setHeader('Accept-Ranges', 'bytes');
       const ranges = req.range(data.length);
@@ -399,8 +435,15 @@ export class DevServer {
       }
       res.send(data);
     });
-    app.delete('/__wxa__/tmp/:name', (req, res) => {
-      res.status(this.tempFiles.delete(req.params.name) ? 204 : 404).end();
+    app.delete<{ session: string; 0: string }>('/__wxa__/tmp/:session/*', (req, res) => {
+      try {
+        const files = this.fileSessions.get(req.params.session);
+        if (!files) throw new Error('file not exist');
+        files.remove(`/__wxa__/tmp/${req.params.session}/` + req.params[0], { dir: false });
+        res.status(204).end();
+      } catch {
+        res.status(404).end();
+      }
     });
 
     if (this.ticketSource) app.use('/__wxa__/api', devtoolsLoginRouter(this.project.appid, this.ticketSource));

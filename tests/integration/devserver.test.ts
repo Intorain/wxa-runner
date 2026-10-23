@@ -107,9 +107,9 @@ describe.skipIf(!ready)('DevServer', () => {
   });
 
   it('临时文件保存后返回可直接访问的地址，按文件类型返回 Content-Type', async () => {
-    const saved = await fetch(base + '/__wxa__/tmp?type=jpg', { method: 'POST', body: Buffer.from('jpeg-bytes') });
+    const saved = await fetch(base + '/__wxa__/tmp/test-session?type=jpg', { method: 'POST', body: Buffer.from('jpeg-bytes') });
     const { url } = await saved.json();
-    expect(url).toMatch(new RegExp(`^${base}/__wxa__/tmp/[\\w-]+\\.jpg$`));
+    expect(url).toMatch(new RegExp(`^${base}/__wxa__/tmp/test-session/[\\w-]+\\.jpg$`));
 
     const file = await fetch(url);
     expect(file.headers.get('content-type')).toContain('image/jpeg');
@@ -118,7 +118,7 @@ describe.skipIf(!ready)('DevServer', () => {
   });
 
   it('临时文件支持分段请求（video 组件播放时要能跳转），分段和完整响应的 ETag 相同，超出范围时返回 416', async () => {
-    const saved = await fetch(base + '/__wxa__/tmp?type=mp4', { method: 'POST', body: Buffer.from('0123456789') });
+    const saved = await fetch(base + '/__wxa__/tmp/test-session?type=mp4', { method: 'POST', body: Buffer.from('0123456789') });
     const { url } = await saved.json();
 
     const part = await fetch(url, { headers: { range: 'bytes=2-5' } });
@@ -138,7 +138,7 @@ describe.skipIf(!ready)('DevServer', () => {
   });
 
   it('临时文件可以只查大小，删除后访问不到', async () => {
-    const saved = await fetch(base + '/__wxa__/tmp?type=txt', { method: 'POST', body: Buffer.from('hello') });
+    const saved = await fetch(base + '/__wxa__/tmp/test-session?type=txt', { method: 'POST', body: Buffer.from('hello') });
     const { url } = await saved.json();
 
     const head = await fetch(url, { method: 'HEAD' });
@@ -147,6 +147,23 @@ describe.skipIf(!ready)('DevServer', () => {
     expect((await fetch(url, { method: 'DELETE' })).status).toBe(204);
     expect((await fetch(url)).status).toBe(404);
     expect((await fetch(url, { method: 'DELETE' })).status).toBe(404);
+  });
+
+  it('文件接口：用户目录的文件可按地址读取，文件不存在等失败照样返回 200，会话标识不合法时返回 400', async () => {
+    const fsCall = (session: string, operation: string, args: object) =>
+      fetch(`${base}/__wxa__/fs/${session}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ operation, args })
+      });
+    const filePath = `${base}/__wxa__/usr/fs-session/a.txt`;
+    expect(await (await fsCall('fs-session', 'writeFile', { filePath, data: 'hi', encoding: 'utf8' })).json()).toEqual({ result: {} });
+    expect(await (await fetch(filePath)).text()).toBe('hi');
+
+    const missing = await fsCall('fs-session', 'access', { path: 'http://usr/missing' });
+    expect(missing.status).toBe(200);
+    expect(await missing.json()).toEqual({ error: 'no such file or directory http://usr/missing' });
+    expect((await fsCall('bad.session', 'access', { path: 'http://usr/x' })).status).toBe(400);
   });
 
   it.skipIf(!readRegionData('districts'))('地区选择器用的行政区划数据取自本机开发者工具', async () => {

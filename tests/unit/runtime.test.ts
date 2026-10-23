@@ -3,7 +3,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { MemoryFileSystem } from '../../packages/core/src/runtime/host/api/fs';
+import { FileStore } from '../../packages/core/src/server/FileStore';
 import { ApiContext, ApiRegistry } from '../../packages/core/src/runtime/host/api/registry';
 import { createStorageApis, KeyValueStore, MiniProgramStorage } from '../../packages/core/src/runtime/host/api/storage';
 import { PageStack } from '../../packages/core/src/runtime/host/PageStack';
@@ -138,18 +138,18 @@ describe('Storage', () => {
   });
 });
 
-describe('MemoryFileSystem', () => {
+describe('FileStore', () => {
   it('支持 USER_DATA_PATH 风格的路径，递归创建目录后读写文件', () => {
-    const fs = new MemoryFileSystem();
+    const fs = new FileStore();
     fs.mkdir('http://usr/logs/a', true);
     fs.write('http://usr/logs/a/1.log', 'x');
     fs.write('http://usr/logs/a/1.log', 'y', true);
-    expect(fs.read('http://usr/logs/a/1.log')).toBe('xy');
+    expect(fs.read('http://usr/logs/a/1.log').toString()).toBe('xy');
     expect(fs.readdir('http://usr/logs')).toEqual(['a']);
   });
 
   it('父目录不存在、重复创建、删除非空目录时报错', () => {
-    const fs = new MemoryFileSystem();
+    const fs = new FileStore();
     expect(() => fs.write('/a/b.txt', '')).toThrow('no such file or directory');
     fs.mkdir('/a');
     expect(() => fs.mkdir('/a')).toThrow('already exists');
@@ -157,5 +157,16 @@ describe('MemoryFileSystem', () => {
     expect(() => fs.remove('/a', { dir: true })).toThrow('not empty');
     fs.remove('/a', { dir: true, recursive: true });
     expect(fs.stat('/a/b.txt')).toBeUndefined();
+  });
+
+  it('预先创建的目录和它们的上级目录不能 rmdir，其中的子目录照常可以', () => {
+    const fs = new FileStore(['/__wxa__/usr/s1', '/__wxa__/tmp/s1']);
+    fs.mkdir('/__wxa__/usr/s1/sub');
+    for (const dirPath of ['/__wxa__/usr/s1', 'http://localhost/__wxa__/usr/s1/', '/__wxa__/usr', '/__wxa__', '/', 'http://usr/']) {
+      expect(() => fs.execute('rmdir', { dirPath, recursive: true })).toThrow('operation not permitted');
+    }
+    fs.execute('rmdir', { dirPath: '/__wxa__/usr/s1/sub' });
+    expect(fs.readdir('/__wxa__/usr/s1')).toEqual([]);
+    expect(fs.readdir('/__wxa__/tmp/s1')).toEqual([]);
   });
 });
